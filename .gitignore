@@ -1,5 +1,5 @@
 # API Keys - NEVER commit
-lib/core/constants/keys.dart
+lib/core/constants/keys_local.dart
 
 # Flutter/Dart build outputs
 build/
