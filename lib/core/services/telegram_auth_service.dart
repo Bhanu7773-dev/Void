@@ -921,54 +921,46 @@ class TelegramAuthService {
   }
 
   /// Fast server-side lookup for the storage channel by exact title.
-  /// This does NOT scan the archive; it just asks the server directly.
+  /// Searches archived chats where private channels typically reside.
   Future<int?> _findStorageChannelOnServer() async {
     await waitUntilAuthenticated();
 
+    // Check archived chats (private channels end up here)
+    print('🔎 Checking archived chats for $_storageChannelName ...');
     try {
-      final result = await request(
+      final archivedResult = await request(
         {
-          '@type': 'searchChatsOnServer',
-          'query': _storageChannelName,
-          'limit': 10,
+          '@type': 'getChats',
+          'chat_list': {'@type': 'chatListArchive'},
+          'limit': 100,
         },
         timeout: const Duration(seconds: 15),
       );
 
-      final ids = (result['chat_ids'] as List?)?.cast<int>() ?? [];
+      final archivedIds = (archivedResult['chat_ids'] as List?)?.cast<int>() ?? [];
+      print('🔎 Archive has ${archivedIds.length} chats');
 
-      for (final id in ids) {
+      for (final id in archivedIds) {
         try {
           final chat = await request(
-            {
-              '@type': 'getChat',
-              'chat_id': id,
-            },
+            {'@type': 'getChat', 'chat_id': id},
             timeout: const Duration(seconds: 10),
           );
 
           if (await _isValidStorageChannelChat(chat)) {
-            print('✅ _findStorageChannelOnServer found channel: $id');
-            // Ensure it lives in archive for cleanliness
-            await archiveChat(id);
+            print('✅ Found storage channel in archive: $id');
             return id;
           }
-        } on TelegramException catch (e) {
-          print('⚠️ getChat failed for candidate $id: $e');
         } catch (e) {
-          print('⚠️ Unknown error reading candidate chat $id: $e');
+          // Skip inaccessible chats
         }
       }
-
-      print('ℹ️ _findStorageChannelOnServer: no matching channel found');
-      return null;
-    } on TelegramException catch (e) {
-      print('⚠️ searchChatsOnServer failed: $e');
-      return null;
     } catch (e) {
-      print('⚠️ searchChatsOnServer unknown error: $e');
-      return null;
+      print('⚠️ Archive search failed: $e');
     }
+
+    print('ℹ️ _findStorageChannelOnServer: no matching channel found');
+    return null;
   }
 
   /// Create a new private channel (supergroup)
@@ -1142,7 +1134,7 @@ class TelegramAuthService {
       'offset': 0,
       'limit': 0,
       'synchronous': true,
-    });
+    }, timeout: const Duration(minutes: 5)); // Large files need more time
 
     final local = result['local'] as Map<String, dynamic>?;
     final path = local?['path'] as String?;
@@ -1161,7 +1153,7 @@ class TelegramAuthService {
       '@type': 'getRemoteFile',
       'remote_file_id': remoteFileId,
       'only_if_prior': false,
-    });
+    }, timeout: const Duration(seconds: 30));
 
     final fileId = file['id'] as int?;
     if (fileId == null) {

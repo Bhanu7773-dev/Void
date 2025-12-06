@@ -1,8 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:path/path.dart' as p;
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -981,6 +984,13 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
             Text('Uploaded: ${item.uploadedAt?.toString().split('.').first ?? 'N/A'}'),
             if (item.telegramMessageId != null)
               Text('Message ID: ${item.telegramMessageId}'),
+            Text('File ID: ${item.telegramFileId ?? "NOT SET"}', 
+              style: TextStyle(
+                color: (item.telegramFileId == null || item.telegramFileId!.isEmpty) 
+                  ? Colors.red : Colors.grey,
+                fontSize: 12,
+              ),
+            ),
             const SizedBox(height: 16),
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceEvenly,
@@ -988,10 +998,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
                 ElevatedButton.icon(
                   onPressed: () {
                     Navigator.pop(context);
-                    // TODO: Implement download & decrypt
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Download coming soon!')),
-                    );
+                    _downloadToGallery(item);
                   },
                   icon: const Icon(Icons.download),
                   label: const Text('Download'),
@@ -1047,40 +1054,290 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
   }
   
   Future<void> _deleteItem(CloudMediaItem item) async {
+    // Show deleting indicator
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            const SizedBox(
+              width: 20,
+              height: 20,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+            const SizedBox(width: 12),
+            Text('Deleting "${item.originalFileName}"...'),
+          ],
+        ),
+        duration: const Duration(seconds: 10),
+      ),
+    );
+
     try {
-      // Delete from Telegram
-      if (item.telegramMessageId != null) {
-        final authService = ref.read(telegramAuthServiceProvider);
-        final channelId = await authService.getStoredChannelId();
-        if (channelId != null) {
+      final authService = ref.read(telegramAuthServiceProvider);
+      final channelId = await authService.getStoredChannelId();
+
+      // 1. Delete the main file message from Telegram
+      if (item.telegramMessageId != null && channelId != null) {
+        try {
           await authService.deleteMessage(channelId, item.telegramMessageId!);
+          print('🗑️ Deleted main message ${item.telegramMessageId}');
+        } catch (e) {
+          print('⚠️ Failed to delete main message: $e');
+        }
+      }
+
+      // 2. Always try to find and delete the thumbnail message from Telegram
+      if (channelId != null) {
+        try {
+          print('🔎 Searching for thumbnail with item.id: ${item.id}');
+          await _deleteThumbnailMessage(authService, channelId, item.id);
+        } catch (e) {
+          print('⚠️ Failed to delete thumbnail message: $e');
         }
       }
       
-      // Delete thumbnail
-      if (item.localThumbnailPath != null) {
-        final thumbFile = File(item.localThumbnailPath!);
-        if (await thumbFile.exists()) {
-          await thumbFile.delete();
+      // 3. Delete local thumbnail file
+      if (item.localThumbnailPath != null && item.localThumbnailPath!.isNotEmpty) {
+        try {
+          final thumbFile = File(item.localThumbnailPath!);
+          if (await thumbFile.exists()) {
+            await thumbFile.delete();
+            print('🗑️ Deleted local thumbnail: ${item.localThumbnailPath}');
+          }
+        } catch (e) {
+          print('⚠️ Failed to delete local thumbnail: $e');
         }
       }
+
+      // 4. Clear any cached files in temp directory
+      try {
+        final tempDir = await getTemporaryDirectory();
+        final patterns = [
+          'void_dec_${item.id}',
+          'void_download_${item.id}',
+          '${item.id}_remote_thumb',
+        ];
+        
+        await for (final entity in tempDir.list()) {
+          if (entity is File) {
+            final name = p.basename(entity.path);
+            if (patterns.any((pattern) => name.contains(pattern))) {
+              await entity.delete();
+              print('🗑️ Deleted cached file: ${entity.path}');
+            }
+          }
+        }
+      } catch (e) {
+        print('⚠️ Failed to clean temp files: $e');
+      }
       
-      // Delete from Hive
+      // 5. Delete from Hive database
       final box = ref.read(mediaBoxProvider);
       await box.delete(item.id);
+      print('🗑️ Deleted from database: ${item.id}');
       
       if (mounted) {
+        ScaffoldMessenger.of(context).hideCurrentSnackBar();
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Deleted "${item.originalFileName}"')),
+          SnackBar(
+            content: Text('Deleted "${item.originalFileName}"'),
+            backgroundColor: Colors.green,
+          ),
         );
         setState(() {}); // Refresh UI
       }
     } catch (e) {
       if (mounted) {
+        ScaffoldMessenger.of(context).hideCurrentSnackBar();
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to delete: $e')),
+          SnackBar(
+            content: Text('Failed to delete: $e'),
+            backgroundColor: Colors.red,
+          ),
         );
       }
+    }
+  }
+
+  /// Find and delete the thumbnail message associated with an item
+  Future<void> _deleteThumbnailMessage(
+    dynamic authService,
+    int channelId,
+    String itemId,
+  ) async {
+    try {
+      int? fromMessageId;
+      bool found = false;
+      int pagesSearched = 0;
+      const maxPages = 5; // Search up to 500 messages
+
+      print('🔎 Starting thumbnail search for itemId: $itemId');
+
+      while (!found && pagesSearched < maxPages) {
+        // Search through messages to find the thumbnail
+        final page = await authService.request({
+          '@type': 'getChatHistory',
+          'chat_id': channelId,
+          'from_message_id': fromMessageId ?? 0,
+          'offset': 0,
+          'limit': 100,
+          'only_local': false,
+        }, timeout: const Duration(seconds: 30));
+
+        final messages = (page['messages'] as List?) ?? [];
+        print('🔎 Page $pagesSearched: found ${messages.length} messages');
+        if (messages.isEmpty) break;
+
+        for (final raw in messages) {
+          final msg = raw as Map<String, dynamic>;
+          final content = msg['content'] as Map<String, dynamic>?;
+          if (content == null || content['@type'] != 'messageDocument') continue;
+
+          final captionObj = content['caption'] as Map<String, dynamic>?;
+          final captionText = captionObj?['text'] as String? ?? '';
+
+          // Check if this is a thumbnail message
+          if (captionText.startsWith('#void_thumb ')) {
+            print('🔎 Found a #void_thumb message: ${captionText.substring(0, 50)}...');
+            try {
+              final jsonPart = captionText.substring('#void_thumb '.length);
+              final meta = jsonDecode(jsonPart) as Map<String, dynamic>;
+              final thumbTargetId = meta['id'] as String?;
+              print('🔎 Thumb target ID: $thumbTargetId, looking for: $itemId');
+              
+              if (thumbTargetId == itemId) {
+                final thumbMsgId = msg['id'] as int?;
+                if (thumbMsgId != null) {
+                  await authService.deleteMessage(channelId, thumbMsgId);
+                  print('🗑️ Deleted thumbnail message $thumbMsgId for item $itemId');
+                  found = true;
+                }
+                break;
+              }
+            } catch (e) {
+              print('⚠️ Error parsing thumb caption: $e');
+            }
+          }
+        }
+
+        if (!found) {
+          final lastMsg = messages.last as Map<String, dynamic>;
+          fromMessageId = lastMsg['id'] as int?;
+          pagesSearched++;
+        }
+      }
+
+      if (!found) {
+        print('ℹ️ No thumbnail message found for item $itemId (searched $pagesSearched pages)');
+      }
+    } catch (e) {
+      print('⚠️ Error searching for thumbnail message: $e');
+    }
+  }
+
+  Future<void> _downloadToGallery(CloudMediaItem item) async {
+    if (item.telegramFileId == null || item.telegramFileId!.isEmpty || item.encryptionIV.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('File not available for download. ID: ${item.telegramFileId ?? "null"}, IV: ${item.encryptionIV.isEmpty ? "empty" : "ok"}'),
+          backgroundColor: Colors.orange,
+        ),
+      );
+      return;
+    }
+
+    final cryptoHelper = ref.read(cryptoHelperProvider);
+    if (!cryptoHelper.hasKey) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Vault is locked. Please unlock first.')),
+      );
+      return;
+    }
+
+    // Show downloading indicator
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            const SizedBox(
+              width: 20,
+              height: 20,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+            const SizedBox(width: 12),
+            Expanded(child: Text('Downloading ${item.originalFileName}...')),
+          ],
+        ),
+        duration: const Duration(seconds: 30),
+      ),
+    );
+
+    try {
+      final authService = ref.read(telegramAuthServiceProvider);
+
+      // 1. Download encrypted file from Telegram
+      final encryptedPath = await authService.downloadFileByRemoteId(item.telegramFileId!);
+
+      // 2. Decrypt to temp location
+      final tempDir = await getTemporaryDirectory();
+      final ext = p.extension(item.originalFileName).isNotEmpty
+          ? p.extension(item.originalFileName)
+          : '.jpg';
+      final decryptedPath = p.join(tempDir.path, 'void_download_${item.id}$ext');
+      
+      await cryptoHelper.decryptFileToPath(
+        File(encryptedPath),
+        item.encryptionIV,
+        decryptedPath,
+      );
+
+      // 3. Save to gallery using photo_manager
+      final decryptedFile = File(decryptedPath);
+      if (!await decryptedFile.exists()) {
+        throw Exception('Decryption failed');
+      }
+
+      if (item.mediaType == MediaType.video) {
+        await PhotoManager.editor.saveVideo(
+          decryptedFile,
+          title: item.originalFileName,
+        );
+      } else {
+        // For images and documents, save as image
+        await PhotoManager.editor.saveImageWithPath(
+          decryptedPath,
+          title: item.originalFileName,
+        );
+      }
+
+      // 4. Clean up temp files
+      try {
+        await File(encryptedPath).delete();
+      } catch (_) {}
+      try {
+        await decryptedFile.delete();
+      } catch (_) {}
+
+      if (!mounted) return;
+
+      // Hide the downloading snackbar
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Saved "${item.originalFileName}" to gallery'),
+          backgroundColor: Colors.green,
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Download failed: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
     }
   }
 
