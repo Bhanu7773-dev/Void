@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:hive_flutter/hive_flutter.dart';
@@ -157,7 +158,10 @@ class UploadQueueService {
     final file = File(task.filePath);
     final fileName = p.basename(task.filePath);
     File? encryptedTempFile;
+    File? encryptedThumbTempFile;
     String? thumbnailPath;
+    String? thumbnailRemoteId;
+    String? thumbnailIV;
 
     try {
       // Step 0: Generate thumbnail for images (before encryption)
@@ -171,6 +175,16 @@ class UploadQueueService {
       task.progress = 0.1;
       _notifyStateChange();
       debugPrint('🔐 Encrypting: $fileName');
+
+      // Ensure vault config exists in channel (salt/iterations for recovery)
+      final saltB64 = _cryptoHelper.currentSaltBase64;
+      if (saltB64 != null) {
+        await _telegramService.ensureVaultConfig(
+          chatId: _storageChannelId,
+          saltBase64: saltB64,
+          iterations: _cryptoHelper.currentIterations,
+        );
+      }
 
       final iv = _cryptoHelper.generateIV();
       final encryptedBytes = await _cryptoHelper.encryptFile(file, iv);
@@ -190,8 +204,18 @@ class UploadQueueService {
       _notifyStateChange();
       debugPrint('📤 Uploading: $fileName');
 
-      // Create caption with metadata (encrypted filename for later retrieval)
-      final caption = 'VOID:$fileName';
+      final createdAtIso = DateTime.now().toIso8601String();
+      final meta = {
+        'v': 1,
+        'id': task.id,
+        'name': fileName,
+        'media_type': task.mediaType.name,
+        'iv': iv,
+        'size': await file.length(),
+        'created_at': createdAtIso,
+      };
+
+      final caption = '${TelegramAuthService.storageMetaPrefix}${jsonEncode(meta)}';
       
       debugPrint('📤 Uploading to channel: $_storageChannelId');
       debugPrint('📤 Encrypted file path: ${encryptedTempFile.path}');
@@ -237,18 +261,59 @@ class UploadQueueService {
         }
       }
 
+      // Step 3b: Upload encrypted thumbnail as separate message (for fast restore)
+      if (thumbnailPath != null) {
+        try {
+          final thumbIv = _cryptoHelper.generateIV();
+          thumbnailIV = thumbIv;
+          final thumbFile = File(thumbnailPath);
+          final thumbBytes = await _cryptoHelper.encryptFile(thumbFile, thumbIv);
+
+          final tempDir = await getTemporaryDirectory();
+          final thumbTempPath = '${tempDir.path}/void_thumb_${task.id}.tmp';
+          encryptedThumbTempFile = File(thumbTempPath);
+          await encryptedThumbTempFile.writeAsBytes(thumbBytes);
+
+          final thumbMeta = {
+            'id': task.id,
+            'iv': thumbIv,
+            'size': await thumbFile.length(),
+            'mime': 'image/jpeg',
+          };
+
+          final thumbCaption = '${TelegramAuthService.storageThumbPrefix}${jsonEncode(thumbMeta)}';
+
+          final thumbResult = await _telegramService.sendFile(
+            chatId: _storageChannelId,
+            filePath: encryptedThumbTempFile.path,
+            caption: thumbCaption,
+          );
+
+          final thumbContent = thumbResult['content'] as Map<String, dynamic>?;
+          final thumbDoc = thumbContent?['document'] as Map<String, dynamic>?;
+          final thumbRemote = thumbDoc?['document']?['remote'] as Map<String, dynamic>?;
+          thumbnailRemoteId = thumbRemote?['id'] as String?;
+        } catch (e) {
+          debugPrint('⚠️ Thumbnail upload failed for ${task.id}: $e');
+        }
+      }
+
       // Save metadata to Hive
+      final createdAt = DateTime.tryParse(createdAtIso) ?? DateTime.now();
+
       final mediaItem = CloudMediaItem(
         id: task.id,
         originalFileName: fileName,
         localThumbnailPath: thumbnailPath,
         telegramMessageId: messageId,
         telegramFileId: fileId,
+        thumbnailFileId: thumbnailRemoteId,
+        thumbnailIV: thumbnailIV,
         encryptionIV: iv,
         fileSize: await file.length(),
         mediaType: task.mediaType,
         uploadStatus: UploadStatus.completed,
-        createdAt: DateTime.now(),
+        createdAt: createdAt,
         uploadedAt: DateTime.now(),
         originalFilePath: task.filePath,
       );
@@ -262,6 +327,9 @@ class UploadQueueService {
       // DON'T delete temp file immediately - TDLib uploads asynchronously
       // Schedule deletion after TDLib has time to complete the upload
       _scheduleFileDeletion(encryptedTempFile.path);
+      if (encryptedThumbTempFile != null) {
+        _scheduleFileDeletion(encryptedThumbTempFile.path);
+      }
     } catch (e) {
       // Delete thumbnail on error
       if (thumbnailPath != null) {
@@ -270,6 +338,9 @@ class UploadQueueService {
       // Only delete temp file on error
       if (encryptedTempFile != null && await encryptedTempFile.exists()) {
         await encryptedTempFile.delete();
+      }
+      if (encryptedThumbTempFile != null && await encryptedThumbTempFile.exists()) {
+        await encryptedThumbTempFile.delete();
       }
       rethrow;
     }

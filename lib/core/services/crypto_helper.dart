@@ -4,34 +4,118 @@ import 'dart:math';
 import 'dart:typed_data';
 import 'package:encrypt/encrypt.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:cryptography/cryptography.dart' as crypto;
 
 /// Helper class for AES-256 encryption/decryption
 class CryptoHelper {
-  static const String _keyStorageKey = 'void_encryption_key';
+  static const String _legacyKeyStorageKey = 'void_encryption_key';
+  static const String _saltStorageKey = 'void_pbkdf2_salt';
+  static const String _iterationsStorageKey = 'void_pbkdf2_iterations';
+  static const int _defaultIterations = 100000;
   static const _secureStorage = FlutterSecureStorage();
   
   Key? _key;
+  Uint8List? _salt;
+  int _iterations = _defaultIterations;
+
+  bool get hasKey => _key != null;
+
+  Future<bool> hasStoredSalt() async {
+    final storedSalt = await _secureStorage.read(key: _saltStorageKey);
+    return storedSalt != null;
+  }
   
-  /// Initialize the crypto helper and load/generate the encryption key
-  Future<void> init() async {
+  /// Initialize crypto helper.
+  ///
+  /// If a passphrase is provided, derives the key using PBKDF2 with stored (or newly created) salt.
+  /// If no passphrase is provided, falls back to legacy stored key if present; otherwise generates
+  /// a device-bound key (will be lost on uninstall) and logs a warning.
+  Future<void> init({String? passphrase}) async {
     if (_key != null) return;
-    
-    // Try to load existing key
-    final storedKey = await _secureStorage.read(key: _keyStorageKey);
-    
-    if (storedKey != null) {
-      _key = Key.fromBase64(storedKey);
-      print('CryptoHelper: Loaded existing encryption key');
-    } else {
-      // Generate new 256-bit key
-      final keyBytes = _generateSecureRandomBytes(32); // 32 bytes = 256 bits
+
+    // Legacy fallback: use stored key if no passphrase provided
+    if (passphrase == null) {
+      final legacy = await _secureStorage.read(key: _legacyKeyStorageKey);
+      if (legacy != null) {
+        _key = Key.fromBase64(legacy);
+        print('CryptoHelper: Loaded legacy encryption key');
+        return;
+      }
+    }
+
+    // Try to load salt/iterations
+    final storedSalt = await _secureStorage.read(key: _saltStorageKey);
+    final storedIters = await _secureStorage.read(key: _iterationsStorageKey);
+
+    if (storedSalt != null) {
+      _salt = base64Decode(storedSalt);
+      _iterations = int.tryParse(storedIters ?? '') ?? _defaultIterations;
+      if (passphrase == null) {
+        throw StateError('Passphrase required to derive encryption key');
+      }
+      await _deriveAndStore(passphrase, persistSalt: false);
+      return;
+    }
+
+    // No salt yet: require passphrase to create new vault key
+    if (passphrase == null) {
+      // Backward-compatible fallback: generate a device-bound key (not recoverable)
+      final keyBytes = _generateSecureRandomBytes(32);
       _key = Key(keyBytes);
-      
-      // Store the key securely
-      await _secureStorage.write(key: _keyStorageKey, value: _key!.base64);
-      print('CryptoHelper: Generated and stored new encryption key');
+      await _secureStorage.write(
+        key: _legacyKeyStorageKey,
+        value: _key!.base64,
+      );
+      print('CryptoHelper: Generated device-bound key (no passphrase provided). WARNING: not recoverable after uninstall.');
+      return;
+    }
+
+    _salt = _generateSecureRandomBytes(16);
+    _iterations = _defaultIterations;
+    await _deriveAndStore(passphrase, persistSalt: true);
+  }
+
+  /// Derive key from passphrase and store salt/iterations if requested
+  Future<void> _deriveAndStore(String passphrase, {required bool persistSalt}) async {
+    final pbkdf2 = crypto.Pbkdf2(
+      macAlgorithm: crypto.Hmac.sha256(),
+      iterations: _iterations,
+      bits: 256,
+    );
+
+    final secretKey = crypto.SecretKey(utf8.encode(passphrase));
+    final newKey = await pbkdf2.deriveKey(
+      secretKey: secretKey,
+      nonce: _salt!,
+    );
+    final keyBytes = await newKey.extractBytes();
+    _key = Key(Uint8List.fromList(keyBytes));
+
+    if (persistSalt) {
+      await _secureStorage.write(
+        key: _saltStorageKey,
+        value: base64Encode(_salt!),
+      );
+      await _secureStorage.write(
+        key: _iterationsStorageKey,
+        value: _iterations.toString(),
+      );
     }
   }
+
+  /// Check if vault key exists (salt stored) and requires passphrase
+  Future<bool> needsPassphrase() async {
+    final storedSalt = await _secureStorage.read(key: _saltStorageKey);
+    if (storedSalt != null) {
+      // already initialized vault that needs passphrase to derive
+      return _key == null;
+    }
+    return false;
+  }
+
+  /// Expose salt/iterations for syncing to Telegram config
+  String? get currentSaltBase64 => _salt != null ? base64Encode(_salt!) : null;
+  int get currentIterations => _iterations;
   
   /// Generate cryptographically secure random bytes
   Uint8List _generateSecureRandomBytes(int length) {

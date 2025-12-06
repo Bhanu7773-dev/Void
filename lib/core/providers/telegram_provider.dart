@@ -1,5 +1,7 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:hive/hive.dart';
 import 'package:tele_gallery/features/auth/providers/auth_provider.dart';
+import 'package:tele_gallery/shared/models/cloud_media_item.dart';
 
 /// State for storage channel
 class StorageChannelState {
@@ -43,6 +45,11 @@ class StorageChannelNotifier extends Notifier<StorageChannelState> {
       // Use the same auth service that handles authentication
       final telegramService = ref.read(telegramAuthServiceProvider);
       final channelId = await telegramService.findOrCreateStorageChannel();
+      // Rebuild local cache if empty (fresh install/clear data)
+      final mediaBox = Hive.box<CloudMediaItem>('cloud_media');
+      if (mediaBox.isEmpty) {
+        await telegramService.rebuildIndexFromStorageChannel(mediaBox: mediaBox);
+      }
       state = StorageChannelState(channelId: channelId);
     } catch (e) {
       state = state.copyWith(isLoading: false, error: e.toString());

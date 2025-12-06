@@ -50,8 +50,10 @@ final uploadQueueServiceProvider = FutureProvider<UploadQueueService?>((
     return null;
   }
 
-  // Initialize crypto helper
-  await cryptoHelper.init();
+  // Require vault key to be derived before creating upload service
+  if (!cryptoHelper.hasKey) {
+    return null;
+  }
 
   final service = UploadQueueService(
     telegramService: telegramService,

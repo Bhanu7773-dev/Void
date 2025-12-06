@@ -49,6 +49,14 @@ class CloudMediaItem extends HiveObject {
   @HiveField(4)
   String? telegramFileId;
 
+  /// Remote file ID for encrypted thumbnail (if uploaded separately)
+  @HiveField(14)
+  String? thumbnailFileId;
+
+  /// IV for encrypted thumbnail (base64)
+  @HiveField(15)
+  String? thumbnailIV;
+
   /// Encryption IV (Initialization Vector) - base64 encoded
   @HiveField(5)
   final String encryptionIV;
@@ -91,6 +99,8 @@ class CloudMediaItem extends HiveObject {
     this.localThumbnailPath,
     this.telegramMessageId,
     this.telegramFileId,
+    this.thumbnailFileId,
+    this.thumbnailIV,
     required this.encryptionIV,
     required this.fileSize,
     required this.mediaType,
@@ -113,6 +123,8 @@ class CloudMediaItem extends HiveObject {
     String? localThumbnailPath,
     int? telegramMessageId,
     String? telegramFileId,
+    String? thumbnailFileId,
+    String? thumbnailIV,
     UploadStatus? uploadStatus,
     DateTime? uploadedAt,
     String? errorMessage,
@@ -124,6 +136,8 @@ class CloudMediaItem extends HiveObject {
       localThumbnailPath: localThumbnailPath ?? this.localThumbnailPath,
       telegramMessageId: telegramMessageId ?? this.telegramMessageId,
       telegramFileId: telegramFileId ?? this.telegramFileId,
+      thumbnailFileId: thumbnailFileId ?? this.thumbnailFileId,
+      thumbnailIV: thumbnailIV ?? this.thumbnailIV,
       encryptionIV: encryptionIV,
       fileSize: fileSize,
       mediaType: mediaType,

@@ -115,6 +115,8 @@ class CloudMediaItemAdapter extends TypeAdapter<CloudMediaItem> {
       localThumbnailPath: fields[2] as String?,
       telegramMessageId: fields[3] as int?,
       telegramFileId: fields[4] as String?,
+      thumbnailFileId: fields[14] as String?,
+      thumbnailIV: fields[15] as String?,
       encryptionIV: fields[5] as String,
       fileSize: fields[6] as int,
       mediaType: fields[7] as MediaType,
@@ -130,7 +132,7 @@ class CloudMediaItemAdapter extends TypeAdapter<CloudMediaItem> {
   @override
   void write(BinaryWriter writer, CloudMediaItem obj) {
     writer
-      ..writeByte(14)
+      ..writeByte(16)
       ..writeByte(0)
       ..write(obj.id)
       ..writeByte(1)
@@ -158,7 +160,11 @@ class CloudMediaItemAdapter extends TypeAdapter<CloudMediaItem> {
       ..writeByte(12)
       ..write(obj.errorMessage)
       ..writeByte(13)
-      ..write(obj.originalFilePath);
+      ..write(obj.originalFilePath)
+      ..writeByte(14)
+      ..write(obj.thumbnailFileId)
+      ..writeByte(15)
+      ..write(obj.thumbnailIV);
   }
 
   @override

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:hive_flutter/hive_flutter.dart';
@@ -76,8 +78,12 @@ class _AuthWrapperState extends ConsumerState<AuthWrapper> {
       }
     }
 
-    // Trigger init
-    ref.read(telegramAuthServiceProvider).init();
+    final authService = ref.read(telegramAuthServiceProvider);
+
+    // Trigger init and immediately ask TDLib for the current auth state so
+    // we can skip the login UI when a valid session already exists.
+    await authService.init();
+    unawaited(authService.refreshAuthState());
 
     if (mounted) {
       setState(() {

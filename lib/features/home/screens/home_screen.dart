@@ -1,13 +1,19 @@
+import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:hive/hive.dart';
+import 'package:photo_manager/photo_manager.dart';
 import 'package:tele_gallery/core/providers/telegram_provider.dart';
+import 'package:tele_gallery/core/services/crypto_helper.dart';
 import 'package:tele_gallery/core/services/upload_queue_service.dart';
+import 'package:tele_gallery/features/upload/providers/upload_provider.dart';
 import 'package:tele_gallery/features/auth/providers/auth_provider.dart';
 import 'package:tele_gallery/features/auth/screens/login_screen.dart';
-import 'package:tele_gallery/features/upload/providers/upload_provider.dart';
 import 'package:tele_gallery/shared/models/cloud_media_item.dart';
 
 class HomeScreen extends ConsumerStatefulWidget {
@@ -17,8 +23,26 @@ class HomeScreen extends ConsumerStatefulWidget {
   ConsumerState<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends ConsumerState<HomeScreen> {
+class _HomeScreenState extends ConsumerState<HomeScreen>
+  with AutomaticKeepAliveClientMixin {
   bool _isUploading = false;
+  bool _vaultUnlocking = false;
+  bool _thumbBackfillRunning = false;
+  bool _loadingLocal = false;
+  String? _localError;
+  List<AssetEntity> _localAssets = const [];
+  Map<String, Uint8List?> _localThumbCache = const {};
+  Set<String> _selectedAssetIds = {};
+  bool _selectionMode = false;
+  bool _batchUploading = false;
+  int _currentTabIndex = 0;
+  bool _decodingThumbs = false;
+  int _thumbQueueIndex = 0;
+  int _activeThumbDecoders = 0;
+  static const int _maxThumbConcurrency = 2;
+  Future<void>? _localLoadFuture;
+
+  static const int _maxLocalFiles = 400; // cap to keep UI snappy
 
   @override
   void initState() {
@@ -26,6 +50,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     // Initialize storage channel when home screen loads
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref.read(storageChannelProvider.notifier).initialize();
+      _localLoadFuture ??= _loadLocalImages();
       
       // Listen for auth state changes
       ref.listenManual(authStateProvider, (previous, next) {
@@ -36,7 +61,257 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           }
         });
       });
+
+      // Listen for storage channel readiness to unlock vault
+      ref.listenManual(storageChannelProvider, (previous, next) {
+        if (next.isReady && !_vaultUnlocking) {
+          _ensureVaultUnlocked(next.channelId!);
+        }
+      });
     });
+  }
+
+  Future<void> _loadLocalImages() async {
+    if (_loadingLocal) return;
+    setState(() {
+      _loadingLocal = true;
+      _localError = null;
+    });
+
+    try {
+      final perm = await PhotoManager.requestPermissionExtend();
+      if (!perm.isAuth) {
+        setState(() {
+          _localError = 'Photos permission not granted';
+        });
+        return;
+      }
+
+      final paths = await PhotoManager.getAssetPathList(
+        type: RequestType.image,
+        onlyAll: true,
+        filterOption: FilterOptionGroup(
+          orders: [
+            const OrderOption(type: OrderOptionType.createDate, asc: false),
+          ],
+        ),
+      );
+
+      if (paths.isEmpty) {
+        setState(() {
+          _localAssets = const [];
+          _localThumbCache = const {};
+        });
+        return;
+      }
+
+      final mainPath = paths.first;
+      final assets = await mainPath.getAssetListRange(
+        start: 0,
+        end: _maxLocalFiles,
+      );
+
+      setState(() {
+        _localAssets = assets;
+        _localThumbCache = {};
+        _thumbQueueIndex = 0;
+      });
+
+      _pumpThumbDecodeQueue();
+    } catch (e) {
+      setState(() {
+        _localError = e.toString();
+      });
+    } finally {
+      setState(() {
+        _loadingLocal = false;
+      });
+    }
+  }
+
+  void _pumpThumbDecodeQueue() {
+    if (!mounted || _decodingThumbs) return;
+    _decodingThumbs = true;
+
+    void startNext() {
+      if (!mounted) return;
+      while (_activeThumbDecoders < _maxThumbConcurrency &&
+          _thumbQueueIndex < _localAssets.length) {
+        final idx = _thumbQueueIndex++;
+        final asset = _localAssets[idx];
+        if (_localThumbCache.containsKey(asset.id)) {
+          continue;
+        }
+
+        _activeThumbDecoders++;
+        asset
+            .thumbnailDataWithSize(
+              const ThumbnailSize(192, 192),
+              quality: 75,
+            )
+            .then((thumb) {
+          if (!mounted) return;
+          if (thumb != null) {
+            setState(() {
+              _localThumbCache = {
+                ..._localThumbCache,
+                asset.id: thumb,
+              };
+            });
+          }
+        }).catchError((e, st) {
+          debugPrint('Local thumb decode failed for ${asset.id}: $e');
+        }).whenComplete(() {
+          _activeThumbDecoders--;
+          startNext();
+        });
+      }
+
+      if (_activeThumbDecoders == 0) {
+        _decodingThumbs = false;
+      }
+    }
+
+    startNext();
+  }
+
+
+  Future<void> _ensureVaultUnlocked(int channelId) async {
+    if (!mounted) return;
+    final cryptoHelper = ref.read(cryptoHelperProvider);
+    if (cryptoHelper.hasKey) {
+      // Vault already unlocked in this session; still try backfill if needed
+      await _backfillThumbnails(cryptoHelper);
+      return;
+    }
+
+    _vaultUnlocking = true;
+    try {
+      final hasSalt = await cryptoHelper.hasStoredSalt();
+      final isCreate = !hasSalt;
+      final passphrase = await _promptPassphrase(isCreate: isCreate);
+      if (passphrase == null || passphrase.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Vault password is required to proceed.')),
+        );
+        return;
+      }
+
+      await cryptoHelper.init(passphrase: passphrase);
+
+      // Post vault config to channel so it can be recovered on reinstall
+      final saltB64 = cryptoHelper.currentSaltBase64;
+      if (saltB64 != null) {
+        final telegramService = ref.read(telegramAuthServiceProvider);
+        await telegramService.ensureVaultConfig(
+          chatId: channelId,
+          saltBase64: saltB64,
+          iterations: cryptoHelper.currentIterations,
+        );
+      }
+
+      // Backfill thumbnails for restored items (images)
+      await _backfillThumbnails(cryptoHelper);
+
+      // Recreate upload service now that key is available
+      ref.invalidate(uploadQueueServiceProvider);
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(isCreate ? 'Vault created.' : 'Vault unlocked.')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Vault unlock failed: $e')),
+      );
+    } finally {
+      _vaultUnlocking = false;
+    }
+  }
+
+  Future<void> _backfillThumbnails(CryptoHelper cryptoHelper) async {
+    if (_thumbBackfillRunning) return;
+    _thumbBackfillRunning = true;
+    try {
+      final mediaBox = Hive.box<CloudMediaItem>('cloud_media');
+        final missing = mediaBox.values.where((item) =>
+          item.mediaType == MediaType.image &&
+          (item.localThumbnailPath == null || item.localThumbnailPath!.isEmpty) &&
+          item.telegramFileId != null).length;
+
+      if (missing == 0) {
+        _thumbBackfillRunning = false;
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Generating thumbnails for $missing image(s)...'),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+
+      final telegramService = ref.read(telegramAuthServiceProvider);
+      final generated = await telegramService.backfillThumbnailsForImages(
+        mediaBox: mediaBox,
+        cryptoHelper: cryptoHelper,
+        maxCount: null,
+        maxBytes: 50 * 1024 * 1024, // skip huge files when backfilling thumbs
+      );
+
+      if (!mounted) return;
+      if (generated > 0) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Generated $generated thumbnails.')),
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No thumbnails generated.')),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Thumbnail backfill failed: $e')),
+      );
+    } finally {
+      _thumbBackfillRunning = false;
+    }
+  }
+
+  Future<String?> _promptPassphrase({required bool isCreate}) async {
+    final controller = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return AlertDialog(
+          title: Text(isCreate ? 'Set Vault Password' : 'Enter Vault Password'),
+          content: TextField(
+            controller: controller,
+            obscureText: true,
+            autofocus: true,
+            decoration: InputDecoration(
+              labelText: isCreate ? 'New password' : 'Password',
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(null),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () {
+                final value = controller.text.trim();
+                if (value.isEmpty) return;
+                Navigator.of(ctx).pop(value);
+              },
+              child: Text(isCreate ? 'Create' : 'Unlock'),
+            ),
+          ],
+        );
+      },
+    );
   }
   
   void _navigateToLogin() {
@@ -209,6 +484,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
+    super.build(context);
     final storageState = ref.watch(storageChannelProvider);
     final mediaItems = ref.watch(completedUploadsProvider);
 
@@ -235,7 +511,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         ],
       ),
       body: _buildBody(storageState, mediaItems),
-      floatingActionButton: storageState.isReady
+      floatingActionButton: storageState.isReady && _currentTabIndex == 0
           ? FloatingActionButton.extended(
               onPressed: _isUploading ? null : _pickAndUploadFiles,
               icon: _isUploading
@@ -332,15 +608,285 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     }
 
     if (state.isReady) {
-      // Show gallery if we have items, otherwise show placeholder
-      if (mediaItems.isNotEmpty) {
-        return _buildGallery(mediaItems);
-      }
-      return _buildGalleryPlaceholder(state.channelId!);
+      return DefaultTabController(
+        length: 2,
+        child: Builder(
+          builder: (context) {
+            return NotificationListener<ScrollNotification>(
+              onNotification: (_) {
+                // Update tab index when user swipes between tabs
+                final tabController = DefaultTabController.of(context);
+                if (_currentTabIndex != tabController.index && mounted) {
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    if (mounted && _currentTabIndex != tabController.index) {
+                      setState(() {
+                        _currentTabIndex = tabController.index;
+                      });
+                    }
+                  });
+                }
+                return false;
+              },
+              child: Column(
+                children: [
+                  TabBar(
+                    onTap: (index) {
+                      if (_currentTabIndex != index && mounted) {
+                        setState(() {
+                          _currentTabIndex = index;
+                        });
+                      }
+                    },
+                    tabs: const [
+                      Tab(text: 'Server'),
+                      Tab(text: 'Local'),
+                    ],
+                  ),
+                  Expanded(
+                    child: TabBarView(
+                      children: [
+                        mediaItems.isNotEmpty
+                            ? _buildGallery(mediaItems)
+                            : _buildGalleryPlaceholder(state.channelId!),
+                        _buildLocalGallery(),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+      );
     }
 
     return const Center(child: Text('Initializing...'));
   }
+
+  Widget _buildLocalGallery() {
+    // While loading first time, show spinner
+    if (_localAssets.isEmpty && _loadingLocal) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_localError != null) {
+      return Center(child: Text('Local gallery error: $_localError'));
+    }
+    if (_localAssets.isEmpty) {
+      return const Center(child: Text('No local photos found'));
+    }
+
+    return Stack(
+      children: [
+        GridView.builder(
+          padding: const EdgeInsets.all(8),
+          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: 3,
+            crossAxisSpacing: 4,
+            mainAxisSpacing: 4,
+          ),
+          itemCount: _localAssets.length,
+          itemBuilder: (context, index) {
+            final asset = _localAssets[index];
+            final thumb = _localThumbCache[asset.id];
+            final isSelected = _selectedAssetIds.contains(asset.id);
+            return GestureDetector(
+              onTap: () {
+                if (_selectionMode) {
+                  setState(() {
+                    if (isSelected) {
+                      _selectedAssetIds.remove(asset.id);
+                      if (_selectedAssetIds.isEmpty) {
+                        _selectionMode = false;
+                      }
+                    } else {
+                      _selectedAssetIds.add(asset.id);
+                    }
+                  });
+                }
+              },
+              onLongPress: () {
+                if (!_selectionMode) {
+                  setState(() {
+                    _selectionMode = true;
+                    _selectedAssetIds = {asset.id};
+                  });
+                }
+              },
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  Container(
+                    decoration: BoxDecoration(
+                      color: Colors.grey[800],
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    clipBehavior: Clip.antiAlias,
+                    child: thumb != null
+                        ? Image.memory(
+                            thumb,
+                            fit: BoxFit.cover,
+                            gaplessPlayback: true,
+                            filterQuality: FilterQuality.low,
+                          )
+                        : const _ShimmerTile(icon: Icons.photo),
+                  ),
+                  if (_selectionMode)
+                    Positioned(
+                      top: 6,
+                      right: 6,
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 150),
+                        width: 24,
+                        height: 24,
+                        decoration: BoxDecoration(
+                          color: isSelected ? Colors.blue : Colors.black38,
+                          shape: BoxShape.circle,
+                          border: Border.all(color: Colors.white, width: 2),
+                        ),
+                        child: isSelected
+                            ? const Icon(Icons.check, size: 16, color: Colors.white)
+                            : null,
+                      ),
+                    ),
+                  if (isSelected)
+                    Container(
+                      decoration: BoxDecoration(
+                        color: Colors.blue.withOpacity(0.3),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
+                ],
+              ),
+            );
+          },
+        ),
+        // Selection toolbar
+        if (_selectionMode)
+          Positioned(
+            bottom: 16,
+            left: 16,
+            right: 16,
+            child: Material(
+              elevation: 8,
+              borderRadius: BorderRadius.circular(16),
+              color: Theme.of(context).colorScheme.primaryContainer,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                child: Row(
+                  children: [
+                    Text(
+                      '${_selectedAssetIds.length} selected',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        color: Theme.of(context).colorScheme.onPrimaryContainer,
+                      ),
+                    ),
+                    const Spacer(),
+                    TextButton(
+                      onPressed: () {
+                        setState(() {
+                          _selectionMode = false;
+                          _selectedAssetIds = {};
+                        });
+                      },
+                      child: const Text('Cancel'),
+                    ),
+                    const SizedBox(width: 8),
+                    ElevatedButton.icon(
+                      onPressed: _batchUploading ? null : _uploadSelectedPhotos,
+                      icon: _batchUploading
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.cloud_upload),
+                      label: Text(_batchUploading ? 'Uploading...' : 'Upload'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Future<void> _uploadSelectedPhotos() async {
+    if (_selectedAssetIds.isEmpty || _batchUploading) return;
+
+    final uploadService = await ref.read(uploadQueueServiceProvider.future);
+    if (uploadService == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Upload service not ready. Please wait...')),
+        );
+      }
+      return;
+    }
+
+    setState(() {
+      _batchUploading = true;
+    });
+
+    final selectedIds = _selectedAssetIds.toList();
+    final assetsToUpload = _localAssets.where((a) => selectedIds.contains(a.id)).toList();
+
+    int uploaded = 0;
+    final total = assetsToUpload.length;
+
+    for (final asset in assetsToUpload) {
+      if (!mounted) break;
+
+      try {
+        final file = await asset.file;
+        if (file == null) {
+          debugPrint('Asset ${asset.id} has no file');
+          continue;
+        }
+
+        await uploadService.addToQueue(file.path);
+        uploaded++;
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Queued $uploaded / $total'),
+              duration: const Duration(seconds: 1),
+            ),
+          );
+        }
+
+        // 3 second gap between each upload queue add
+        if (uploaded < total) {
+          await Future.delayed(const Duration(seconds: 3));
+        }
+      } catch (e) {
+        debugPrint('Failed to queue asset ${asset.id}: $e');
+      }
+    }
+
+    if (mounted) {
+      setState(() {
+        _batchUploading = false;
+        _selectionMode = false;
+        _selectedAssetIds = {};
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Added $uploaded file(s) to upload queue'),
+          action: SnackBarAction(
+            label: 'View Queue',
+            onPressed: () => _showUploadQueue(uploadService),
+          ),
+        ),
+      );
+    }
+  }
+
+  @override
+  bool get wantKeepAlive => true;
 
   Widget _buildGallery(List<CloudMediaItem> items) {
     return GridView.builder(
@@ -413,13 +959,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
   
   Widget _buildPlaceholder(CloudMediaItem item) {
-    return Center(
-      child: Icon(
-        _getMediaIcon(item.mediaType),
-        size: 32,
-        color: Colors.grey[400],
-      ),
-    );
+    return _ShimmerTile(icon: _getMediaIcon(item.mediaType));
   }
   
   void _showMediaDetails(CloudMediaItem item) {
@@ -608,6 +1148,74 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ShimmerTile extends StatefulWidget {
+  final IconData icon;
+  const _ShimmerTile({required this.icon});
+
+  @override
+  State<_ShimmerTile> createState() => _ShimmerTileState();
+}
+
+class _ShimmerTileState extends State<_ShimmerTile>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 2),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, child) {
+        final t = _controller.value; // 0..1
+        final offset = (t * 2) - 1; // -1..1
+
+        return Container(
+          decoration: BoxDecoration(
+            color: Colors.grey.shade900,
+          ),
+          child: ShaderMask(
+            shaderCallback: (rect) {
+              return LinearGradient(
+                begin: Alignment(-1 - offset, -1),
+                end: Alignment(1 - offset, 1),
+                colors: [
+                  Colors.grey.shade800,
+                  Colors.grey.shade600,
+                  Colors.grey.shade800,
+                ],
+                stops: const [0.2, 0.5, 0.8],
+              ).createShader(rect);
+            },
+            blendMode: BlendMode.srcATop,
+            child: child,
+          ),
+        );
+      },
+      child: Center(
+        child: Icon(
+          widget.icon,
+          size: 32,
+          color: Colors.white70,
         ),
       ),
     );
