@@ -222,6 +222,18 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(isCreate ? 'Vault created.' : 'Vault unlocked.')),
       );
+    } on WrongPassphraseException {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Incorrect passphrase. Please try again.'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      // Allow retry by calling this method again
+      _vaultUnlocking = false;
+      await _ensureVaultUnlocked(channelId);
+      return;
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(

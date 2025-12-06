@@ -11,6 +11,8 @@ class CryptoHelper {
   static const String _legacyKeyStorageKey = 'void_encryption_key';
   static const String _saltStorageKey = 'void_pbkdf2_salt';
   static const String _iterationsStorageKey = 'void_pbkdf2_iterations';
+  static const String _verificationStorageKey = 'void_passphrase_verification';
+  static const String _verificationPlaintext = 'VOID_VAULT_VERIFICATION_v1';
   static const int _defaultIterations = 100000;
   static const _secureStorage = FlutterSecureStorage();
   
@@ -72,11 +74,13 @@ class CryptoHelper {
 
     _salt = _generateSecureRandomBytes(16);
     _iterations = _defaultIterations;
-    await _deriveAndStore(passphrase, persistSalt: true);
+    await _deriveAndStore(passphrase, persistSalt: true, isNewVault: true);
   }
 
   /// Derive key from passphrase and store salt/iterations if requested
-  Future<void> _deriveAndStore(String passphrase, {required bool persistSalt}) async {
+  /// If isNewVault is true, creates verification data
+  /// If isNewVault is false, verifies the passphrase is correct
+  Future<void> _deriveAndStore(String passphrase, {required bool persistSalt, bool isNewVault = false}) async {
     final pbkdf2 = crypto.Pbkdf2(
       macAlgorithm: crypto.Hmac.sha256(),
       iterations: _iterations,
@@ -90,6 +94,57 @@ class CryptoHelper {
     );
     final keyBytes = await newKey.extractBytes();
     _key = Key(Uint8List.fromList(keyBytes));
+
+    if (isNewVault) {
+      // New vault: create verification data
+      final iv = IV.fromSecureRandom(16);
+      final encrypter = Encrypter(AES(_key!, mode: AESMode.cbc));
+      final encrypted = encrypter.encrypt(_verificationPlaintext, iv: iv);
+      
+      // Store: iv:ciphertext in base64
+      final verificationData = '${iv.base64}:${encrypted.base64}';
+      await _secureStorage.write(
+        key: _verificationStorageKey,
+        value: verificationData,
+      );
+      print('CryptoHelper: Created new vault with verification');
+    } else {
+      // Existing vault: verify the passphrase is correct
+      final storedVerification = await _secureStorage.read(key: _verificationStorageKey);
+      if (storedVerification != null) {
+        try {
+          final parts = storedVerification.split(':');
+          if (parts.length == 2) {
+            final iv = IV.fromBase64(parts[0]);
+            final encrypted = Encrypted.fromBase64(parts[1]);
+            final encrypter = Encrypter(AES(_key!, mode: AESMode.cbc));
+            final decrypted = encrypter.decrypt(encrypted, iv: iv);
+            
+            if (decrypted != _verificationPlaintext) {
+              _key = null; // Clear the wrong key
+              throw WrongPassphraseException('Incorrect passphrase');
+            }
+            print('CryptoHelper: Passphrase verified successfully');
+          }
+        } catch (e) {
+          _key = null; // Clear the wrong key
+          if (e is WrongPassphraseException) rethrow;
+          throw WrongPassphraseException('Incorrect passphrase');
+        }
+      } else {
+        // No verification data (legacy vault or first migration)
+        // Create verification data for future use
+        final iv = IV.fromSecureRandom(16);
+        final encrypter = Encrypter(AES(_key!, mode: AESMode.cbc));
+        final encrypted = encrypter.encrypt(_verificationPlaintext, iv: iv);
+        final verificationData = '${iv.base64}:${encrypted.base64}';
+        await _secureStorage.write(
+          key: _verificationStorageKey,
+          value: verificationData,
+        );
+        print('CryptoHelper: Migrated existing vault - added verification');
+      }
+    }
 
     if (persistSalt) {
       await _secureStorage.write(
@@ -212,4 +267,13 @@ class CryptoHelper {
   
   /// Check if the crypto helper is initialized
   bool get isInitialized => _key != null;
+}
+
+/// Exception thrown when the passphrase is incorrect
+class WrongPassphraseException implements Exception {
+  final String message;
+  WrongPassphraseException(this.message);
+  
+  @override
+  String toString() => 'WrongPassphraseException: $message';
 }
