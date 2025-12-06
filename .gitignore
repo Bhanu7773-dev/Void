@@ -1,1 +1,44 @@
+# API Keys - NEVER commit
 lib/core/constants/keys.dart
+
+# Flutter/Dart build outputs
+build/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+
+# Android build
+android/build/
+android/.gradle/
+android/local.properties
+android/app/build/
+*.apk
+*.aab
+
+# iOS build
+ios/Pods/
+ios/.symlinks/
+ios/Flutter/Flutter.framework
+ios/Flutter/Flutter.podspec
+ios/Runner.xcworkspace/xcuserdata/
+
+# macOS build
+macos/Flutter/ephemeral/
+macos/Pods/
+
+# Windows/Linux build
+windows/flutter/ephemeral/
+linux/flutter/ephemeral/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Misc
+*.log
+*.lock
+!pubspec.lock
+.DS_Store
+Thumbs.db
